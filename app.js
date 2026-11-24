@@ -6,7 +6,7 @@ const TABS = [
   ['home','الرئيسية','Home'],['courses','المقررات','Courses'],['library','المكتبة','Library'],
   ['news','الأخبار','News'],['training','الدورات التدريبية','Training'],['places','الأرقام والأماكن','Places'],
   ['vision','رؤية 2030','Vision 2030'],['media','المكتبة المرئية','Media'],['contact','تواصل معنا','Contact'],
-  ['login','دخول المتدربات','Login']
+  ['login','دخول المتدربات','Login'],['admin','لوحة التحكم','Admin']
 ];
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -16,8 +16,11 @@ function headers(){ return token ? {'Content-Type':'application/json',Authorizat
 async function api(p, opts={}){ const r = await fetch(p, {...opts, headers:headers()}); if(!r.ok){ const e = await r.json().catch(()=>({})); throw new Error(e.error || ('HTTP '+r.status)); } return r.json(); }
 
 /* ---------- tabs & language ---------- */
-function renderTabs(){ $('tabs').innerHTML = TABS.map(t=>`<button data-v="${t[0]}" onclick="show('${t[0]}')">${lang==='ar'?t[1]:t[2]}</button>`).join(''); }
+// The admin tab is staff-only: it is rendered only after a staff login
+// (admin/academic/trainer) and hidden for guests and trainees.
+function renderTabs(){ const list = TABS.filter(t => t[0] !== 'admin' || isStaff()); $('tabs').innerHTML = list.map(t=>`<button data-v="${t[0]}" onclick="show('${t[0]}')">${lang==='ar'?t[1]:t[2]}</button>`).join(''); }
 function show(v){
+  if(v === 'admin' && !isStaff()){ v = 'login'; }
   document.querySelectorAll('.view').forEach(s=>s.classList.add('hidden'));
   const el = $('view-'+v); if(el) el.classList.remove('hidden');
   document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('active', b.dataset.v===v));
@@ -256,6 +259,7 @@ function logout(){
   $('myBox').classList.add('hidden'); $('authBox').classList.remove('hidden');
   $('adminPanel').classList.add('hidden'); $('adminBar').classList.remove('show');
   $('userBox').classList.add('hidden'); $('userBox').textContent = '';
+  renderTabs(); show('home');
   toast('تم تسجيل الخروج');
 }
 async function changePw(){
@@ -276,9 +280,10 @@ function afterAuth(){
   } else {
     $('adminPanel').classList.add('hidden'); $('adminBar').classList.remove('show');
   }
+  renderTabs();
   loadCourses();
 }
-function openAdmin(){ $('adminPanel').scrollIntoView({behavior:'smooth'}); adminTab('users'); }
+function openAdmin(){ show('admin'); adminTab('users'); }
 
 /* ---------- admin panel ---------- */
 function adminTab(name){

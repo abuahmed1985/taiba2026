@@ -21,7 +21,7 @@
   <nav class="tabs" id="tabs" aria-label="التبويبات الرئيسية"></nav>
 </header>
 <div id="adminBar">👑 <span id="adminBarText">لوحة التحكم متاحة لك — سجّلتِ كموظفة (إدارة / أكاديمي / مدربة)</span>
-  <button class="btn gold small" onclick="show('login');openAdmin()">فتح لوحة التحكم ⚙️</button></div>
+  <button class="btn gold small" onclick="show('admin')">فتح لوحة التحكم ⚙️</button></div>
 <main>
   <!-- ===== Home ===== -->
   <section id="view-home" class="view">
@@ -207,6 +207,9 @@
       </div>
     </div>
 
+  </section>
+  <!-- ===== Admin panel as a top tab: staff only ===== -->
+  <section id="view-admin" class="view hidden">
     <!-- ===== Admin panel: staff only, shown after staff login ===== -->
     <div class="card gold-border hidden" id="adminPanel">
       <div class="admin-head"><span style="font-size:34px">⚙️</span><div>

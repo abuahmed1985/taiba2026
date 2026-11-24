@@ -6,11 +6,15 @@
  * Passwords: NEVER hard-coded. Staff passwords come from env vars
  * ADMIN_PASSWORD / ACADEMIC_PASSWORD / TRAINER_PASSWORD. If unset on first
  * boot, random ones are generated and printed ONCE in the startup log.
- * PDF note: the server PDF embeds Noto Sans Arabic (OFL, shipped flat beside
- * server.js as NotoSansArabic-Regular/Bold.ttf), so its Arabic is real,
- * searchable text — but pdfkit does NOT shape Arabic, so letters appear
- * unjoined. The Word (.doc) download and the in-browser print view shape
- * Arabic correctly — use those for the Arabic book. See README §7.
+ * PDF note: server PDFs now render CORRECT Arabic — connected letters,
+ * correct RTL word order, no boxes. pdfkit cannot shape Arabic itself, so
+ * every Arabic string is reshaped (arabic-reshaper) + reordered with the
+ * Unicode bidi algorithm (bidi-js) and drawn with the embedded Amiri font
+ * (OFL, shipped flat beside server.js as Amiri-Regular/Bold.ttf), which
+ * covers Arabic presentation forms AND Latin letters/digits. The shipped
+ * Noto Sans Arabic subset has NO Latin glyphs — that is what made "Opera"
+ * and "BKG-OPERA" appear as boxes. Word (.doc) and the in-browser print
+ * view shape Arabic natively and are unchanged.
  * Book images: Word downloads are MHTML (multipart/related) with each image
  * embedded once (data: URIs do not render in Microsoft Word); PDF books
  * embed the cover + one image per unit, fetched with up to 3 retries, with
@@ -26,6 +30,8 @@ const PDFDocument = require('pdfkit');
 const PptxGenJS = require('pptxgenjs');
 const multer = require('multer');
 const XLSX = require('xlsx');
+const arabicReshaper = require('arabic-reshaper');
+const bidi = require('bidi-js')();
 const seed = require('./seed');
 
 const PORT = process.env.PORT || 3000;
@@ -392,6 +398,10 @@ app.get('/api/admin/uploads', auth, requireRole(...STAFF), (req, res) => {
 // ---- downloads: login required for ALL formats; Word/PPTX staff only ----
 // Trainees: PDF only. Trainer / academic / admin: PDF + Word + PowerPoint.
 function courseBook(code) {
+  // Booking books have real full content (5 units x 3 lessons) in
+  // booking-full.js — not the 1-unit fallback below.
+  const bk = seed.BOOKING_CONTENT && seed.BOOKING_CONTENT[code];
+  if (bk) return { code: bk.code, titleAr: bk.titleAr, titleEn: bk.titleEn || '', descAr: bk.descAr || '', level: bk.level || 2, units: bk.units };
   const c = db.prepare('SELECT * FROM courses WHERE code=?').get(code)
     || db.prepare('SELECT * FROM library_books WHERE code=?').get(code);
   if (!c) return null;
@@ -472,15 +482,15 @@ function loadLogos() {
   });
 }
 
-// ---- Arabic font for server PDFs ----
-// pdfkit with its built-in Helvetica renders Arabic as Latin gibberish
-// (WinAnsi, no Arabic glyphs). Embedding Noto Sans Arabic (OFL) makes the
-// PDF's Arabic real, searchable text. pdfkit still does NOT shape Arabic
-// (no joining), so letters appear unjoined — Word and the in-browser print
-// view remain the correctly-shaped Arabic routes. Font files live flat
-// beside server.js (NotoSansArabic-Regular.ttf / -Bold.ttf) so GitHub web
-// upload works; fonts/ and public/fonts/ are also accepted. Missing fonts
-// fall back silently to Helvetica — the server never crashes for this.
+// ---- Arabic font + shaping for server PDFs ----
+// Amiri (OFL) is the PDF font: it covers Arabic presentation forms AND
+// Latin letters/digits/punctuation, so mixed text like "نظام أوبرا Opera"
+// renders fully. Noto Sans Arabic (also shipped) is kept only as a
+// fallback — its subset has no Latin glyphs, which is exactly what made
+// "Opera" / "BKG-OPERA" appear as boxes. Font files live flat beside
+// server.js (Amiri-Regular.ttf / Amiri-Bold.ttf) so GitHub web upload
+// works; fonts/ and public/fonts/ are also accepted. Missing fonts fall
+// back silently to Helvetica — the server never crashes for this.
 function fontPaths(name) {
   return [path.join(__dirname, name), path.join(__dirname, 'fonts', name),
     path.join(__dirname, 'public', 'fonts', name), path.join(process.cwd(), name),
@@ -488,8 +498,10 @@ function fontPaths(name) {
 }
 function registerArabicFonts(doc) {
   try {
-    const reg = fontPaths('NotoSansArabic-Regular.ttf').find(f => fs.existsSync(f));
-    const bold = fontPaths('NotoSansArabic-Bold.ttf').find(f => fs.existsSync(f));
+    const reg = fontPaths('Amiri-Regular.ttf').find(f => fs.existsSync(f))
+      || fontPaths('NotoSansArabic-Regular.ttf').find(f => fs.existsSync(f));
+    const bold = fontPaths('Amiri-Bold.ttf').find(f => fs.existsSync(f))
+      || fontPaths('NotoSansArabic-Bold.ttf').find(f => fs.existsSync(f));
     if (!reg) return false;
     doc.registerFont('ar', reg);
     if (bold) doc.registerFont('ar-bold', bold);
@@ -499,6 +511,84 @@ function registerArabicFonts(doc) {
 }
 function arFont(doc, bold) {
   if (doc && doc._arOk) { try { doc.font(bold ? 'ar-bold' : 'ar'); } catch (e) { /* fall back to default font */ } }
+  return doc;
+}
+
+// Amiri covers every character in the real content except three rare ones
+// (arrows / ≤), which are replaced by plain-ASCII equivalents before shaping.
+const ARABIC_RE = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/;
+const VISUAL_FIX = { '→': '->', '←': '<-', '≤': '<=', '≥': '>=' };
+// Logical Arabic -> visual order for pdfkit: reshape letters to their
+// joined presentation forms, then reorder with the Unicode bidi algorithm
+// (base direction RTL). Pure Latin/digit strings pass through untouched.
+// Glyphs Amiri has no presentation form for (U+FE73/FE75/FEFD/FEFE) are
+// dropped rather than rendered as boxes.
+function visualText(s) {
+  let str = String(s ?? '');
+  if (!ARABIC_RE.test(str)) return str;
+  str = str.replace(/[→←≤≥]/g, ch => VISUAL_FIX[ch] || ch);
+  try {
+    const reshaped = arabicReshaper.convertArabic(str);
+    const levels = bidi.getEmbeddingLevels(reshaped, 'rtl');
+    let out = bidi.getReorderedString(reshaped, levels);
+    out = [...out].filter(ch => { const cp = ch.codePointAt(0); return cp !== 0xFE73 && cp !== 0xFE75 && cp !== 0xFEFD && cp !== 0xFEFE; }).join('');
+    return out;
+  } catch (e) { return str; }
+}
+// Draw one logical string with correct Arabic in a PDF: wrap the LOGICAL
+// text first (glyph advances are direction-independent), reshape + reorder
+// each line to visual order, then draw the line at the right x for its
+// alignment. 'justify' distributes the slack across the gaps of non-last
+// lines; 'right' is used for RTL paragraphs. Handles page breaks itself
+// unless opts.noBreak is set (headers/footers at fixed positions).
+// opts: {x, y, width, align, bold, fontSize, lineGap, indent, noBreak}
+function pdfText(doc, text, opts = {}) {
+  const fontSize = opts.fontSize || 11;
+  arFont(doc, !!opts.bold); doc.fontSize(fontSize);
+  const width = opts.width || (doc.page.width - doc.page.margins.left - doc.page.margins.right);
+  const x = (opts.x !== undefined) ? opts.x : doc.x;
+  const indent = opts.indent || 0;
+  let y = (opts.y !== undefined) ? opts.y : doc.y;
+  const align = opts.align || 'left';
+  const lineHeight = fontSize * 1.35 + (opts.lineGap || 0);
+  const maxY = doc.page.height - 65;
+  const spaceW = doc.widthOfString(' ');
+  const paragraphs = String(text ?? '').split('\n');
+  for (let pi = 0; pi < paragraphs.length; pi++) {
+    const words = paragraphs[pi].split(/\s+/).filter(Boolean);
+    const lines = [];
+    let cur = [], curW = 0;
+    for (const w of words) {
+      const ww = doc.widthOfString(w);
+      if (cur.length && curW + spaceW + ww > (width - indent) * 0.995) { lines.push(cur); cur = [w]; curW = ww; }
+      else { if (cur.length) curW += spaceW; cur.push(w); curW += ww; }
+    }
+    if (cur.length) lines.push(cur);
+    if (!lines.length) { y += lineHeight; continue; }
+    for (let li = 0; li < lines.length; li++) {
+      if (!opts.noBreak && y + lineHeight > maxY) { doc.addPage(); y = doc.page.margins.top; }
+      const logical = lines[li].join(' ');
+      const visual = visualText(logical);
+      const lineW = doc.widthOfString(visual);
+      const isLast = li === lines.length - 1;
+      const lx = x + indent;
+      if (align === 'justify' && !isLast && lines[li].length > 1) {
+        const toks = visual.split(' ');
+        let tw = 0; const widths = toks.map(t => { const w = doc.widthOfString(t); tw += w; return w; });
+        const gap = Math.max(spaceW, (width - indent - tw) / (toks.length - 1));
+        let cx = lx;
+        toks.forEach((t, i) => { doc.text(t, cx, y, { lineBreak: false }); cx += widths[i] + gap; });
+      } else {
+        let x0 = lx;
+        if (align === 'center') x0 = lx + Math.max(0, (width - indent - lineW) / 2);
+        else if (align === 'right' || align === 'justify') x0 = lx + Math.max(0, width - indent - lineW);
+        doc.text(visual, x0, y, { lineBreak: false });
+      }
+      y += lineHeight;
+    }
+    if (pi < paragraphs.length - 1) y += lineHeight * 0.5;
+  }
+  doc.x = x; doc.y = y;
   return doc;
 }
 async function loadBookImages(book) {
@@ -537,14 +627,16 @@ function finishPdf(doc, code, titleAr) {
     doc.switchToPage(i);
     doc.save().rect(40, 40, 515, 762).strokeColor('#0AA5C2').lineWidth(1).stroke().restore();
     if (i > 0) {
-      arFont(doc, false).fontSize(8).fillColor('#555555');
-      doc.text('معهد طيبة العالي للتدريب', 60, 48, { width: 140, align: 'left' });
-      doc.text(titleAr, 205, 48, { width: 185, align: 'center' });
-      doc.text('المؤسسة العامة للتدريب التقني والمهني', 395, 48, { width: 140, align: 'right' });
+      doc.fillColor('#555555');
+      pdfText(doc, 'معهد طيبة العالي للتدريب', { x: 60, y: 48, width: 140, align: 'left', fontSize: 8, noBreak: true });
+      pdfText(doc, titleAr, { x: 205, y: 48, width: 185, align: 'center', fontSize: 8, noBreak: true });
+      pdfText(doc, 'المؤسسة العامة للتدريب التقني والمهني', { x: 395, y: 48, width: 140, align: 'right', fontSize: 8, noBreak: true });
       doc.save().moveTo(60, 64).lineTo(535, 64).strokeColor('#FFD54F').lineWidth(2).stroke().restore();
       doc.fillColor('#000000');
     }
-    arFont(doc, false).fontSize(9).fillColor('#555555').text(`صفحة ${i + 1} من ${pages.count}  |  ${code}`, 60, 782, { width: 475, align: 'center' }).fillColor('#000000');
+    doc.fillColor('#555555');
+    pdfText(doc, `صفحة ${i + 1} من ${pages.count}  |  ${code}`, { x: 60, y: 782, width: 475, align: 'center', fontSize: 9, noBreak: true });
+    doc.fillColor('#000000');
   }
   doc.end();
 }
@@ -553,11 +645,11 @@ function drawImageOrCaption(doc, im, y) {
   const cap = im ? im.caption : '';
   if (im && im.buf) {
     try { doc.image(im.buf, 60, y, { fit: [475, 240], align: 'center' }); doc.y = y + 250; }
-    catch (e) { doc.y = y; arFont(doc, false).fontSize(10).fillColor('#888888').text(`[صورة: ${cap} — تعذّر عرض الصورة]`, { align: 'center' }).fillColor('#000000'); }
+    catch (e) { doc.y = y; doc.fillColor('#888888'); pdfText(doc, `[صورة: ${cap} — تعذّر عرض الصورة]`, { align: 'center', fontSize: 10 }); doc.fillColor('#000000'); }
   } else {
-    doc.y = y; arFont(doc, false).fontSize(10).fillColor('#888888').text(`[صورة: ${cap} — تعذّر تحميل الصورة]`, { align: 'center' }).fillColor('#000000');
+    doc.y = y; doc.fillColor('#888888'); pdfText(doc, `[صورة: ${cap} — تعذّر تحميل الصورة]`, { align: 'center', fontSize: 10 }); doc.fillColor('#000000');
   }
-  arFont(doc, false).fontSize(9).fillColor('#555555').text(cap, { align: 'center' }).fillColor('#000000');
+  doc.fillColor('#555555'); pdfText(doc, cap, { align: 'center', fontSize: 9 }); doc.fillColor('#000000');
   doc.moveDown(0.5);
 }
 function drawLogosPdf(doc, logos) {
@@ -600,25 +692,25 @@ async function handleDownload(req, res) {
       doc.pipe(res);
       drawLogosPdf(doc, logos);
       doc.moveDown(6);
-      arFont(doc, true).fontSize(22).text('معهد طيبة العالي للتدريب', { align: 'center' });
-      arFont(doc, true).fontSize(14).text('المؤسسة العامة للتدريب التقني والمهني', { align: 'center' });
+      pdfText(doc, 'معهد طيبة العالي للتدريب', { align: 'center', bold: true, fontSize: 22 });
+      pdfText(doc, 'المؤسسة العامة للتدريب التقني والمهني', { align: 'center', bold: true, fontSize: 14 });
       doc.moveDown();
-      arFont(doc, true).fontSize(18).text(course.titleAr, { align: 'center' });
-      arFont(doc, true).fontSize(16).text('بنك الأسئلة', { align: 'center' });
-      doc.moveDown().fontSize(11).text(`عدد الأسئلة: ${qs.length} سؤالاً  |  اختيار من متعدد: ${mcq.length}  |  صح / خطأ: ${tf.length}`, { align: 'center' });
-      doc.moveDown().fontSize(10).text('الإجابة الصحيحة والشرح مذكوران بعد كل سؤال.', { align: 'center' });
+      pdfText(doc, course.titleAr, { align: 'center', bold: true, fontSize: 18 });
+      pdfText(doc, 'بنك الأسئلة', { align: 'center', bold: true, fontSize: 16 });
+      doc.moveDown(); pdfText(doc, `عدد الأسئلة: ${qs.length} سؤالاً  |  اختيار من متعدد: ${mcq.length}  |  صح / خطأ: ${tf.length}`, { align: 'center', fontSize: 11 });
+      doc.moveDown(); pdfText(doc, 'الإجابة الصحيحة والشرح مذكوران بعد كل سؤال.', { align: 'center', fontSize: 10 });
       let n = 0;
       const writeSection = (title, list) => {
         if (!list.length) return;
         doc.addPage();
-        arFont(doc, true).fontSize(16).text(title, { align: 'left' });
+        pdfText(doc, title, { align: 'right', bold: true, fontSize: 16 });
         for (const q of list) {
           n++;
-          doc.moveDown().fontSize(12).text(`سؤال ${n}: ${q.question}`);
-          q.options.forEach((o, i) => arFont(doc, false).fontSize(10).text(`   ${AR_LETTERS[i] || (i + 1)} ) ${o}`));
+          doc.moveDown(); pdfText(doc, `سؤال ${n}: ${q.question}`, { align: 'justify', bold: true, fontSize: 12 });
+          q.options.forEach((o, i) => pdfText(doc, `   ${AR_LETTERS[i] || (i + 1)} ) ${o}`, { align: 'right', fontSize: 10 }));
           const correctText = q.options[q.correct] ?? '';
-          arFont(doc, false).fontSize(10).text(`الإجابة الصحيحة: ${AR_LETTERS[q.correct] || ''} ) ${correctText}`);
-          if (q.explanation) arFont(doc, false).fontSize(10).text(`الشرح: ${q.explanation}`);
+          pdfText(doc, `الإجابة الصحيحة: ${AR_LETTERS[q.correct] || ''} ) ${correctText}`, { align: 'right', fontSize: 10 });
+          if (q.explanation) pdfText(doc, `الشرح: ${q.explanation}`, { align: 'right', fontSize: 10 });
         }
       };
       writeSection('القسم الأول: أسئلة الاختيار من متعدد', mcq);
@@ -803,17 +895,17 @@ h1,h2,h3{font-family:'Sultan Medium','Sakkal Majalla',serif;text-align:center} .
   // Cover.
   drawLogosPdf(doc, logos);
   doc.moveDown(6);
-  arFont(doc, true).fontSize(22).text('معهد طيبة العالي للتدريب', { align: 'center' });
-  arFont(doc, true).fontSize(14).text('المؤسسة العامة للتدريب التقني والمهني', { align: 'center' });
+  pdfText(doc, 'معهد طيبة العالي للتدريب', { align: 'center', bold: true, fontSize: 22 });
+  pdfText(doc, 'المؤسسة العامة للتدريب التقني والمهني', { align: 'center', bold: true, fontSize: 14 });
   doc.moveDown();
-  arFont(doc, true).fontSize(20).text('دبلوم السياحة والفندقة', { align: 'center' });
+  pdfText(doc, 'دبلوم السياحة والفندقة', { align: 'center', bold: true, fontSize: 20 });
   doc.moveDown();
-  arFont(doc, true).fontSize(18).text(book.titleAr, { align: 'center' });
-  arFont(doc, false).fontSize(13).text(book.titleEn, { align: 'center' });
-  doc.moveDown().fontSize(11).text(`المستوى ${book.level || ''}  |  ${book.code}`, { align: 'center' });
+  pdfText(doc, book.titleAr, { align: 'center', bold: true, fontSize: 18 });
+  pdfText(doc, book.titleEn, { align: 'center', fontSize: 13 });
+  doc.moveDown(); pdfText(doc, `المستوى ${book.level || ''}  |  ${book.code}`, { align: 'center', fontSize: 11 });
   doc.moveDown();
   drawImageOrCaption(doc, imgBySlot['cover'], doc.y);
-  doc.moveDown().fontSize(11).text(book.descAr || '', { align: 'left' });
+  doc.moveDown(); pdfText(doc, book.descAr || '', { align: 'justify', fontSize: 11 });
   // Table of contents page (filled in after units are generated).
   doc.addPage();
   const tocPageIdx = doc.bufferedPageRange().count - 1;
@@ -821,23 +913,24 @@ h1,h2,h3{font-family:'Sultan Medium','Sakkal Majalla',serif;text-align:center} .
   book.units.forEach((u, i) => {
     doc.addPage();
     unitPages.push(doc.bufferedPageRange().count); // 1-based page number
-    arFont(doc, true).fontSize(16).text(`الوحدة ${i + 1}: ${u.titleAr}`, { align: 'left' });
+    pdfText(doc, `الوحدة ${i + 1}: ${u.titleAr}`, { align: 'right', bold: true, fontSize: 16 });
     doc.moveDown();
     drawImageOrCaption(doc, imgBySlot['unit' + (i + 1)], doc.y);
     for (const l of u.lessons) {
-      doc.moveDown().fontSize(12).text(l.titleAr);
-      arFont(doc, false).fontSize(10).text(l.bodyAr || '');
-      if (l.exampleAr) arFont(doc, false).fontSize(10).text('مثال تطبيقي: ' + l.exampleAr);
-      if (l.activityAr) arFont(doc, false).fontSize(10).text('نشاط: ' + l.activityAr);
+      doc.moveDown(); pdfText(doc, l.titleAr, { align: 'right', bold: true, fontSize: 12 });
+      pdfText(doc, l.bodyAr || '', { align: 'justify', fontSize: 10 });
+      if (l.exampleAr) pdfText(doc, 'مثال تطبيقي: ' + l.exampleAr, { align: 'justify', fontSize: 10 });
+      if (l.activityAr) pdfText(doc, 'نشاط: ' + l.activityAr, { align: 'justify', fontSize: 10 });
     }
   });
   // Fill the TOC page now that unit start pages are known.
   doc.switchToPage(tocPageIdx);
-  arFont(doc, true).fontSize(18).text('فهرس المحتويات', { align: 'center' });
+  doc.y = doc.page.margins.top;
+  pdfText(doc, 'فهرس المحتويات', { align: 'center', bold: true, fontSize: 18 });
   doc.moveDown();
   book.units.forEach((u, i) => {
-    arFont(doc, false).fontSize(13).text(`الوحدة ${i + 1}: ${u.titleAr}  .....  صفحة ${unitPages[i]}`, { align: 'right' });
-    for (const l of u.lessons) arFont(doc, false).fontSize(10).text(`• ${l.titleAr}`, { align: 'right', indent: 20 });
+    pdfText(doc, `الوحدة ${i + 1}: ${u.titleAr}  .....  صفحة ${unitPages[i]}`, { align: 'right', fontSize: 13 });
+    for (const l of u.lessons) pdfText(doc, `• ${l.titleAr}`, { align: 'right', indent: 20, fontSize: 10 });
     doc.moveDown(0.5);
   });
   finishPdf(doc, book.code, book.titleAr);

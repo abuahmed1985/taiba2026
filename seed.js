@@ -205,4 +205,4 @@ function generateLessons(unitTitle) {
   ];
 }
 
-module.exports = { COURSES, BOOKING_BOOKS, DESTINATIONS, STATS, NEWS_SEED, TRAINING_SEED, VIDEOS_SEED, generateQuestions, generateLessons, REAL_CONTENT_LOADED: Array.isArray(REAL_CONTENT) && REAL_CONTENT.length === 16 };
+module.exports = { COURSES, BOOKING_BOOKS, BOOKING_CONTENT: (() => { try { return require('./booking-full.js'); } catch (e) { return {}; } })(), DESTINATIONS, STATS, NEWS_SEED, TRAINING_SEED, VIDEOS_SEED, generateQuestions, generateLessons, REAL_CONTENT_LOADED: Array.isArray(REAL_CONTENT) && REAL_CONTENT.length === 16 };
